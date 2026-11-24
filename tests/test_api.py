@@ -9,10 +9,16 @@
   h5: [12]          1 行, 超温 1
 摘要：S1=[h0,h4) 共 14 行/超 4；S2=[h2,h6) 共 6 行/超 3（与 S1 重叠 h2、h3）。
 """
+import datetime
 import os
+import sqlite3
+import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
+
+from app import logic
 
 BASE = "2026-11-20T00:00:00Z"
 HOURS = {
@@ -225,3 +231,278 @@ def test_hours_listing_and_correction_upsert(seeded):
     r = seeded.put("/hours/2026-11-20T09:00:00Z/readings", json={"temperatures": [7.5]})
     assert r.status_code == 200
     assert r.json()["version"] == 1
+
+
+# ---------- 汇总与整点更正并发交错（修复核心） ----------
+
+@pytest.fixture()
+def barrier():
+    """允许在“只读汇总完成、发布写事务开始”之间插入更正的确定性屏障。
+
+    默认放行，armed 后才阻塞；避免准备阶段的普通摘要请求被挂住。
+    """
+    armed = threading.Event()
+    held = threading.Event()
+    release = threading.Event()
+
+    def _barrier(start_ts, end_ts):
+        if not armed.is_set():
+            return
+        held.set()
+        assert release.wait(timeout=5), "测试未在超时内放行发布屏障"
+
+    logic.summary_publish_barrier = _barrier
+    try:
+        yield armed, held, release
+    finally:
+        logic.summary_publish_barrier = None
+
+
+def _raw_conn():
+    # 直连测试库做白盒核对（登记的小时版本快照等），也用于并发线程里的独立连接
+    conn = sqlite3.connect(os.environ["COLDCHAIN_DB"], isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 10000")
+    return conn
+
+
+def _ts(iso: str) -> int:
+    from app.schemas import to_ts
+
+    return to_ts(datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")))
+
+
+def test_correction_during_summary_conflicts_and_is_not_registered(seeded, barrier):
+    # 先有一份与本次区间相同的旧摘要，验证冲突时不会新增登记
+    r = seeded.post("/summaries", json={"start": BASE, "end": "2026-11-20T04:00:00Z"})
+    assert r.status_code == 201, r.text
+    summaries_before = seeded.get("/summaries").json()
+    assert len(summaries_before) == 1
+
+    armed, held, release = barrier
+    result = {}
+
+    def run_summary():
+        # 独立连接模拟另一个并发请求（TestClient 单门户会串行化 HTTP 调用，
+        # 这里直调 logic 层，锁/事务行为与真实双连接一致）
+        conn = _raw_conn()
+        try:
+            logic.make_summary(conn, _ts(BASE), _ts("2026-11-20T04:00:00Z"))
+        except Exception as exc:  # noqa: BLE001 - 线程内回传异常
+            result["exc"] = exc
+        finally:
+            conn.close()
+
+    armed.set()
+    t = threading.Thread(target=run_summary)
+    t.start()
+    assert held.wait(timeout=5), "摘要线程未到达发布屏障"
+
+    # 汇总尚未结束，区间内整点更正必须能立即提交（不再被写锁卡住到超时）
+    t0 = time.monotonic()
+    conn = _raw_conn()
+    try:
+        version = logic.record_hour(conn, _ts("2026-11-20T01:00:00Z"), [2, 3], overwrite=True)
+    finally:
+        conn.close()
+    elapsed = time.monotonic() - t0
+    assert version == 2
+    assert elapsed < 3, f"更正被汇总阻塞了 {elapsed:.1f}s"
+
+    release.set()
+    t.join(timeout=5)
+
+    # 发布时版本已变化 -> SummaryConflictError（接口层映射为 409），且不登记
+    assert isinstance(result.get("exc"), logic.SummaryConflictError)
+    from app.schemas import to_iso
+
+    assert [to_iso(x) for x in result["exc"].changed_ts] == ["2026-11-20T01:00:00Z"]
+    assert len(seeded.get("/summaries").json()) == len(summaries_before)
+
+    # 第二次“汇总期间更正”（logic 层独立连接），验证重复冲突同样被拒
+    held.clear()
+    release.clear()
+    result2 = {}
+
+    def run_summary2():
+        c = _raw_conn()
+        try:
+            logic.make_summary(c, _ts(BASE), _ts("2026-11-20T04:00:00Z"))
+        except Exception as exc:  # noqa: BLE001
+            result2["exc"] = exc
+        finally:
+            c.close()
+
+    t2 = threading.Thread(target=run_summary2)
+    t2.start()
+    assert held.wait(timeout=5)
+    c = _raw_conn()
+    try:
+        logic.record_hour(c, _ts("2026-11-20T01:00:00Z"), [2, 3, 4], overwrite=True)
+    finally:
+        c.close()
+    release.set()
+    t2.join(timeout=5)
+    assert isinstance(result2.get("exc"), logic.SummaryConflictError)
+
+    # HTTP 层复核：两个请求均在后台线程经 TestClient 门户串行处理，
+    # 主线程在屏障处编排，验证接口返回 409 并列出变化小时
+    held.clear()
+    release.clear()
+    http_result = {}
+
+    def post_summary_http():
+        http_result["resp"] = seeded.post(
+            "/summaries", json={"start": BASE, "end": "2026-11-20T04:00:00Z"}
+        )
+
+    t3 = threading.Thread(target=post_summary_http)
+    t3.start()
+    assert held.wait(timeout=5)
+
+    def put_h2_http():
+        http_result["put"] = seeded.put(
+            "/hours/2026-11-20T02:00:00Z/readings", json={"temperatures": [1, 2, 3]}
+        )
+
+    t4 = threading.Thread(target=put_h2_http)
+    t4.start()
+    # 等待更正实际落库（屏障期间写锁空闲，PUT 应很快完成）
+    deadline = time.monotonic() + 5
+    raw = _raw_conn()
+    try:
+        while time.monotonic() < deadline:
+            v = raw.execute(
+                "SELECT version FROM hours WHERE hour_ts = ?",
+                (_ts("2026-11-20T02:00:00Z"),),
+            ).fetchone()
+            if v is not None and v["version"] >= 2:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("区间内更正未在汇总期间完成")
+    finally:
+        raw.close()
+    release.set()
+    t3.join(timeout=5)
+    t4.join(timeout=5)
+    assert http_result["put"].status_code == 200, http_result["put"].text
+    resp = http_result["resp"]
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "summary_conflict"
+    assert detail["changed_hours"] == ["2026-11-20T02:00:00Z"]
+    assert detail["truncated"] is False
+
+    # 配额足够时，随后的查询反映这次更正（旧摘要失效，回退明细）
+    r = seeded.post(
+        "/query",
+        json={"start": BASE, "end": "2026-11-20T04:00:00Z", "max_detail_rows": 100},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total_readings"] == 13          # 5 + 3(h1) + 3(h2 更正后) + 2
+    assert body["over_temp_readings"] == 3       # h0=1, h1=0, h2=0, h3=2
+
+    # 更正完成后重新发布：登记的小时版本与 hours 当前版本逐小时相符
+    r = seeded.post("/summaries", json={"start": BASE, "end": "2026-11-20T04:00:00Z"})
+    assert r.status_code == 201, r.text
+    new_id = r.json()["id"]
+    assert (r.json()["total_count"], r.json()["over_count"]) == (13, 3)
+    raw = _raw_conn()
+    try:
+        sh = {
+            row["hour_ts"]: row["version"]
+            for row in raw.execute(
+                "SELECT hour_ts, version FROM summary_hours WHERE summary_id = ?",
+                (new_id,),
+            )
+        }
+        cur = {
+            row["hour_ts"]: row["version"]
+            for row in raw.execute("SELECT hour_ts, version FROM hours")
+        }
+        assert len(sh) == 4  # 区间 [00,04) 恰好 4 个小时
+        # 摘要计数所用的小时版本快照必须与当前登记的小时版本逐小时相符
+        assert all(sh[h] == cur[h] for h in sh)
+        assert sh[_ts("2026-11-20T01:00:00Z")] == 3  # h1 经两次更正
+        assert sh[_ts("2026-11-20T02:00:00Z")] == 2  # h2 经一次更正
+    finally:
+        raw.close()
+
+    # 新摘要有效，配额 0 即可查询
+    r = seeded.post(
+        "/query",
+        json={"start": BASE, "end": "2026-11-20T04:00:00Z", "max_detail_rows": 0},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["segments"][0]["summary_id"] == new_id
+
+
+def test_correction_outside_interval_does_not_block_summary(seeded, barrier):
+    armed, held, release = barrier
+    result = {}
+
+    def run_summary():
+        conn = _raw_conn()
+        try:
+            result["summary"] = logic.make_summary(
+                conn, _ts(BASE), _ts("2026-11-20T04:00:00Z")
+            )
+        except Exception as exc:  # noqa: BLE001
+            result["exc"] = exc
+        finally:
+            conn.close()
+
+    armed.set()
+    t = threading.Thread(target=run_summary)
+    t.start()
+    assert held.wait(timeout=5)
+
+    # 区间外的更正照常提交，不影响摘要发布
+    conn = _raw_conn()
+    try:
+        t0 = time.monotonic()
+        version = logic.record_hour(
+            conn, _ts("2026-11-20T05:00:00Z"), [12, 13, 14], overwrite=True
+        )
+        assert time.monotonic() - t0 < 3
+    finally:
+        conn.close()
+    assert version == 2
+
+    release.set()
+    t.join(timeout=5)
+    assert "exc" not in result, result
+    payload = result["summary"]
+    assert (payload["total_count"], payload["over_count"]) == (14, 4)
+
+    summaries = {s["id"]: s for s in seeded.get("/summaries").json()}
+    assert summaries[payload["id"]]["valid"] is True
+
+    # 区间外更正生效：h5 现为 3 行且全部超温，[00,06) 共 18 行、超温 7
+    r = seeded.post(
+        "/query",
+        json={"start": BASE, "end": "2026-11-20T06:00:00Z", "max_detail_rows": 100},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total_readings"] == 18
+    assert body["over_temp_readings"] == 7
+
+
+def test_summary_aggregation_does_not_load_detail_rows(seeded):
+    # 单小时写入大批量明细，摘要计数由 SQL 聚合完成，进程内存不随行数膨胀
+    big_hour = "2026-11-20T08:00:00Z"
+    n = 20000
+    r = seeded.post(f"/hours/{big_hour}/readings", json={"temperatures": [9.0] * n})
+    assert r.status_code == 201, r.text
+    r = seeded.post("/summaries", json={"start": big_hour, "end": "2026-11-20T09:00:00Z"})
+    assert r.status_code == 201, r.text
+    assert (r.json()["total_count"], r.json()["over_count"]) == (n, n)
+
+    r = seeded.put(f"/hours/{big_hour}/readings", json={"temperatures": [1.0] * (n // 2)})
+    assert r.status_code == 200
+    r = seeded.post("/summaries", json={"start": big_hour, "end": "2026-11-20T09:00:00Z"})
+    assert r.status_code == 201, r.text
+    assert (r.json()["total_count"], r.json()["over_count"]) == (n // 2, 0)

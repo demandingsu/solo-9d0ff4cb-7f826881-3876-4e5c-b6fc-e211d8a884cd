@@ -28,7 +28,7 @@ pytest tests/ -v
 | POST | `/hours/{hour}/readings` | 录入某 UTC 整点的非空温度明细；已有数据返回 409 |
 | PUT | `/hours/{hour}/readings` | 更正该小时全部明细（整小时替换，版本 +1） |
 | GET | `/hours` | 已录入小时一览（版本号、行数） |
-| POST | `/summaries` | 为齐备的整点区间 `[start, end)` 生成摘要；缺小时返回 409 |
+| POST | `/summaries` | 为齐备的整点区间 `[start, end)` 生成摘要；缺小时返回 409；发布时版本已变化也返回 409（`summary_conflict`，列明变化小时，摘要不登记） |
 | GET | `/summaries` | 摘要一览，含当前有效性 |
 | POST | `/query` | 在 `max_detail_rows` 配额内查询 `[start, end)` 超温占比 |
 
@@ -45,6 +45,20 @@ pytest tests/ -v
 **摘要失效**：更正某小时 → `hours.version` +1 → 查询时用 `NOT EXISTS(summary_hours 快照版本 ≠ hours 当前版本)` 判定有效性。
 按该小时旧明细生成的摘要自动失效，不相关摘要不受影响（`app/logic.py` 的 `_VALID_SUMMARIES_SQL`）。
 
+**摘要生成（两阶段 OCC，不阻塞更正）**：旧实现用 `BEGIN IMMEDIATE` 在一个写事务里完成
+长区间聚合，持锁期间任何整点更正都拿不到写锁，忙等超时后未捕获的 `database is locked`
+直接变成 500。现拆为两阶段（`app/logic.py: make_summary`）：
+
+1. **只读阶段**（`BEGIN` 读事务）：在同一已提交快照上核对小时齐备性，并以
+   `GROUP BY hour_ts` 的 SQL 聚合逐小时取计数——应用内存里每个小时只有一行
+   `(hour_ts, cnt, over)`，整段温度明细绝不加载进应用内存。此阶段不持写锁，
+   更正请求可随时提交，互不阻塞。
+2. **发布阶段**（短 `BEGIN IMMEDIATE`）：重新读取区间内每个小时的当前版本，与只读阶段
+   的快照版本逐小时比对。全部一致才登记 `summaries` 与 `summary_hours`；任一变化则
+   整体回滚并抛 `SummaryConflictError`，接口返回 409（`reason=summary_conflict`，
+   `changed_hours` 列出发生变化的 UTC 小时，最多 24 条并带 `truncated`），**不登记这份摘要**，
+   客户端可在更正完成后重新发起。区间外的更正不参与版本比对，摘要照常发布。
+
 **查询规划**（`app/logic.py: query_range`）
 
 1. 整条查询在**一个读事务**内完成：有效摘要集合与小时行数来自同一已提交快照。
@@ -52,44 +66,62 @@ pytest tests/ -v
    （明细段成本 = 行数，摘要段成本 = 0；并列取段数更少者），回溯后相邻明细小时合并为一段。
 3. **缺档 / 超预算在读取明细前返回**：`dp` 不可达 → 409 `missing_data`（列出缺档小时）；
    最优成本 > 配额 → 409 `budget_exceeded`（附所需行数）。
-4. 通过检查后才 `SELECT temperature` 读取明细行，分段汇总总笔数、超温笔数与占比，
-   响应标注每段来源（`summary` + `summary_id` 或 `details`）。
+4. 通过检查后才读取明细，且读取同样下推为 SQL 聚合（`COUNT` / 条件 `SUM`，按小时一行），
+   应用不持有温度明细行；响应标注每段来源（`summary` + `summary_id` 或 `details`）。
 
-**健壮性**：自定义 422 处理器只回显 `type/loc/msg`，避免含 NaN 的非法输入在序列化错误体时变成 500。
+**健壮性**：自定义 422 处理器只回显 `type/loc/msg`，避免含 NaN 的非法输入在序列化错误体时变成 500；
+每条连接设置 `busy_timeout=10000`，为发布阶段的瞬时写锁竞争兜底（长汇总已不再持写锁）。
 
 ## 实测
 
-**单元/端到端测试**（`tests/test_api.py`，TestClient + 临时库）：`9 passed`
+**单元/端到端测试**（`tests/test_api.py`，TestClient + 临时库 + 独立连接线程）：`12 passed`
 
 - 录入校验：重复录入 409、空明细 / 非整点 / 缺时区 / NaN → 422
 - 摘要有重叠（S1=[00,04)、S2=[02,06)）时查询 [00,06) 选最优组合
 - 预算不足、缺档均在读明细前返回原因及所需行数/缺档小时
 - 更正 h1 → S1 失效、S2 照用；更正后查询改用 S2+明细且反映新数据；
   重新生成 S1′ 后配额 0 可查；更正两个摘要共有的小时 → 全部失效退回全明细
+- **汇总与更正并发交错**（确定性屏障插在“只读汇总完成、发布前”）：
+  - 区间内更正：汇总未结束更正即成功（实测耗时 0.01s，不再卡到超时），
+    发布返回 409 `summary_conflict` 且 `changed_hours` 精确列明变化小时，摘要不登记；
+    随后配额内查询反映更正；重发成功，白盒核对 `summary_hours.version` 与 `hours.version` 逐小时一致
+  - 区间外更正：照常提交，摘要 201 正常发布且保持有效
+  - HTTP 层同样验证 409 路径（两个后台请求经 TestClient 门户串行处理）
+- 单小时 2 万行明细：摘要计数正确，聚合由 SQL 完成，应用内存不随行数膨胀
 
-**真实服务冒烟**（uvicorn + curl，端口 8734，临时库）：
+**修复前对照**（旧实现 + 人为持锁 8s 模拟长汇总，独立脚本）：更正请求忙等 5.0s 后收到
+`HTTP 500 database is locked`；同一长汇总场景在新实现下更正 0.01s 返回 200，
+摘要发布返回 409 列明变化小时，重发 201。
+
+**真实服务冒烟**（uvicorn + urllib，端口 8765/8767，临时库，脚本在仓库外 `/tmp/selftest`）：
 
 ```
-GET /docs -> 200
-S1=[00,04) -> {"total_count":14,"over_count":4}   S2=[02,06) -> {"total_count":6,"over_count":3}
-
-Q1 查[00,06) 配额100 -> detail_rows_read=2, 超温占比 5/16=0.3125
-   段: summary#1 [00,04) + details [04,06)        # 重叠摘要中选了更优的 S1 方案
-Q2 同段配额1 -> 409 budget_exceeded required_detail_rows=2
-Q3 查[00,08) -> 409 missing_data missing_hours=[06:00, 07:00]
-
-更正 h1=[2,3] -> version=2；GET /summaries: S1 valid=False, S2 valid=True
-Q4 查[00,06) 配额10 -> detail_rows_read=7, 段: details [00,02) + summary#2 [02,06)
-   总 13 笔超温 4 笔（更正后 h1 超温 0 已生效）
-Q5 查[00,04) 配额0 -> 409 budget_exceeded required=11（S1 已失效）
-重新生成 S1'=[00,04) -> {total:11, over:3}；配额0 查询命中 S1'，占比 3/11
+场景 A（区间内更正 × 长汇总交错）
+  更正 PUT -> 200 version=2，elapsed=0.01s（汇总仍在进行）
+  摘要发布 -> 409 summary_conflict changed_hours=[01:00]，摘要总数不增
+  查询 [00,04) 配额100 -> 全明细 11 笔/超温 3（更正已生效）
+  重新发布 -> 201 {total:11, over:3}；配额 0 查询命中新摘要
+  白盒：summary_hours 4 个小时的版本快照与 hours 当前版本完全一致
+场景 B（区间外更正 × 汇总交错）
+  h5 更正 -> 200 version=2；摘要 -> 201 且 valid=true
+  查询 [00,06) -> 15 笔/超温 6（区间外更正已生效）
+场景 C（大区间内存）
+  单小时 100,000 行明细：摘要 0.12s 完成，计数 100000/100000，
+  进程峰值 RSS ≈ 66 MiB（明细未加载进应用内存）
+场景 D（模拟 8s 长汇总）
+  汇总期间更正 -> 200，等待 0.01s；发布 -> 409；更正后重发 -> 201
 ```
 
 ## 余项
 
-- 本环境无 Docker 守护进程，镜像构建未实测；`Dockerfile`/`docker-compose.yml` 为标准配置，应用本身经 uvicorn 实测。
-- 无鉴权与多租户；单 worker 跑 SQLite（写串行），如需并发写可换 PostgreSQL，模型与 SQL 基本可平移。
+- 本环境无 Docker 守护进程（`docker`/`podman` 等均不存在），`docker compose up --build`
+  未实机执行；`Dockerfile`/`docker-compose.yml` 为未改动的标准配置，应用已用同版本
+  依赖经 uvicorn 实跑全部 HTTP 交错场景，`/docs` 与 OpenAPI schema 正常返回。
+- 无鉴权与多租户；单 worker 跑 SQLite（写串行），如需并发写可换 PostgreSQL，模型与 SQL 基本可平移
+  （两阶段 OCC 的版本核对 SQL 与 `GROUP BY` 聚合均为标准语法）。
 - 摘要只增不删，长期运行需归档/清理策略；失效摘要目前保留供审计。
 - 更正是整小时整体替换，不支持单条修改；`PUT` 对不存在的小时按建档处理（version=1）。
-- 查询 DP 复杂度 O(小时数 + 摘要数)，超长区间（如数年）未做分片；缺档小时列表最多回显 24 条。
-- 未做并发更正与查询交错的压测（一致性依赖单读事务快照，SQLite WAL 下读写不互堵）。
+- 查询 DP 复杂度 O(小时数 + 摘要数)，超长区间（如数年）未做分片；缺档/冲突小时列表最多回显 24 条。
+- 409 `summary_conflict` 是可重试冲突：客户端更正落库后重新 POST `/summaries` 即可；
+  若同一区间持续被高频更正，调用方需自行限退。
+- 并发测试通过 `logic.summary_publish_barrier` 测试钩子制造确定性交错；生产环境该钩子默认为 `None`，无额外开销。

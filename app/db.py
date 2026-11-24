@@ -37,9 +37,11 @@ def db_path() -> str:
 
 def connect() -> sqlite3.Connection:
     # isolation_level=None：自动提交，事务用显式 BEGIN/COMMIT 控制
-    conn = sqlite3.connect(db_path(), isolation_level=None)
+    conn = sqlite3.connect(db_path(), isolation_level=None, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # 写锁竞争时最多等待 10s 再报 locked（长汇总已不再持写锁，这里只作兜底）
+    conn.execute("PRAGMA busy_timeout = 10000")
     return conn
 
 

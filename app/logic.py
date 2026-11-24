@@ -1,13 +1,21 @@
 """核心业务：录入/更正整点明细、生成摘要、按配额规划并执行查询。
 
 事务约定：
-- 写操作（录入、更正、生成摘要）用 BEGIN IMMEDIATE，单事务提交。
+- 写操作（录入、更正）用 BEGIN IMMEDIATE，单事务提交，只在短写入期间持写锁。
+- 生成摘要分两阶段（OCC）：
+  1. 只读事务取一致快照并做整段聚合，全程不持写锁，更正请求不会被汇总阻塞；
+  2. 短写事务（BEGIN IMMEDIATE）发布前重新核对每小时版本，任一已变化则整体回滚、
+     抛 SummaryConflictError（不登记摘要），由接口层返回 409 并列明变化的小时。
 - 查询用一条读事务（BEGIN），有效摘要集合与小时行数来自同一已提交快照；
   规划阶段只读 hours/summaries 元数据，确认不缺档、不超预算后才真正读取明细行。
+
+内存约定：整段温度明细绝不加载进应用内存——摘要与明细段的计数都由 SQL 聚合完成，
+应用侧每小时只拿到一行 (hour_ts, cnt, over)，内存开销与小时数成正比，与明细行数无关。
 """
 from __future__ import annotations
 
 import sqlite3
+from typing import Callable, Optional
 
 HOUR_SECONDS = 3600
 OVER_TEMP_THRESHOLD = 8.0  # 超过 8℃ 判定为超温（严格大于）
@@ -30,6 +38,14 @@ ORDER BY s.id
 
 class HourExistsError(Exception):
     """该小时已有明细，应改用更正接口。"""
+
+
+class SummaryConflictError(Exception):
+    """发布摘要时发现统计所用的小时版本已变化，本次摘要不登记。"""
+
+    def __init__(self, changed_ts: list[int]):
+        super().__init__(f"{len(changed_ts)} hour(s) changed since summary stats")
+        self.changed_ts = changed_ts
 
 
 def _rollback_quietly(conn: sqlite3.Connection) -> None:
@@ -83,9 +99,21 @@ def record_hour(conn: sqlite3.Connection, hour_ts: int, temps: list[float], *, o
         raise
 
 
+# 测试/并发自测用屏障：在摘要的只读汇总完成后、发布写事务开始前调用，
+# 用于确定性地制造“汇总期间发起更正”的交错。默认空操作，生产路径无额外开销。
+summary_publish_barrier: Optional[Callable[[int, int], None]] = None
+
+
 def make_summary(conn: sqlite3.Connection, start_ts: int, end_ts: int) -> dict:
-    """为齐备的整点区间生成摘要；任一小时缺明细则拒绝。"""
-    conn.execute("BEGIN IMMEDIATE")
+    """为齐备的整点区间生成摘要；任一小时缺明细则拒绝。
+
+    两阶段提交，避免长汇总持写锁阻塞整点更正：
+    阶段一（只读事务）：在同一已提交快照上核对齐备性并逐小时聚合，全程不持写锁；
+    阶段二（短写事务）：重新核对版本，全部一致才登记摘要及其小时版本快照，
+    否则抛 SummaryConflictError，已做的聚合结果整体丢弃、不落任何记录。
+    """
+    # ---------- 阶段一：只读快照 + SQL 聚合（不持写锁，更正可随时提交） ----------
+    conn.execute("BEGIN")
     try:
         rows = conn.execute(
             "SELECT hour_ts, version, row_count FROM hours WHERE hour_ts >= ? AND hour_ts < ?",
@@ -95,11 +123,45 @@ def make_summary(conn: sqlite3.Connection, start_ts: int, end_ts: int) -> dict:
         missing = [t for t in range(start_ts, end_ts, HOUR_SECONDS) if t not in present]
         if missing:
             raise MissingHoursError(missing)
-        total, over = conn.execute(
-            "SELECT COUNT(*), COALESCE(SUM(temperature > ?), 0) FROM readings "
-            "WHERE hour_ts >= ? AND hour_ts < ?",
-            (OVER_TEMP_THRESHOLD, start_ts, end_ts),
-        ).fetchone()
+        # 聚合下推给 SQLite：每个小时只返回一行计数，应用不加载任何温度明细行
+        agg = {
+            r["hour_ts"]: (r["cnt"], r["over"])
+            for r in conn.execute(
+                "SELECT hour_ts, COUNT(*) AS cnt, "
+                "SUM(CASE WHEN temperature > ? THEN 1 ELSE 0 END) AS over "
+                "FROM readings WHERE hour_ts >= ? AND hour_ts < ? GROUP BY hour_ts",
+                (OVER_TEMP_THRESHOLD, start_ts, end_ts),
+            ).fetchall()
+        }
+        total = sum(c for c, _ in agg.values())
+        over = sum(o for _, o in agg.values())
+        # 快照版本：发布时逐小时核对，保证登记的版本与统计所用明细一致
+        snap_versions = {t: present[t]["version"] for t in range(start_ts, end_ts, HOUR_SECONDS)}
+        conn.execute("COMMIT")
+    except Exception:
+        _rollback_quietly(conn)
+        raise
+
+    # 只读事务已结束：此刻更正请求可自由提交，不受汇总耗时影响
+    if summary_publish_barrier is not None:
+        summary_publish_barrier(start_ts, end_ts)
+
+    # ---------- 阶段二：乐观发布，短写事务内重新核对小时版本 ----------
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cur_rows = conn.execute(
+            "SELECT hour_ts, version FROM hours WHERE hour_ts >= ? AND hour_ts < ?",
+            (start_ts, end_ts),
+        ).fetchall()
+        cur_versions = {r["hour_ts"]: r["version"] for r in cur_rows}
+        changed = [
+            t
+            for t in range(start_ts, end_ts, HOUR_SECONDS)
+            if cur_versions.get(t) != snap_versions[t]
+        ]
+        if changed:
+            # 统计基于的小时版本已变化：拒绝登记，由接口层返回 409
+            raise SummaryConflictError(changed)
         cur = conn.execute(
             "INSERT INTO summaries (start_ts, end_ts, total_count, over_count, created_at) "
             "VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
@@ -108,7 +170,7 @@ def make_summary(conn: sqlite3.Connection, start_ts: int, end_ts: int) -> dict:
         summary_id = cur.lastrowid
         conn.executemany(
             "INSERT INTO summary_hours (summary_id, hour_ts, version) VALUES (?, ?, ?)",
-            [(summary_id, t, present[t]["version"]) for t in range(start_ts, end_ts, HOUR_SECONDS)],
+            [(summary_id, t, snap_versions[t]) for t in range(start_ts, end_ts, HOUR_SECONDS)],
         )
         conn.execute("COMMIT")
         return {"id": summary_id, "total_count": total, "over_count": over}
@@ -198,13 +260,15 @@ def query_range(conn: sqlite3.Connection, start_ts: int, end_ts: int, max_detail
                 seg_total, seg_over, summary_id = s["total_count"], s["over_count"], s["id"]
             else:
                 hour_list = [start_ts + k * HOUR_SECONDS for k in range(i, j)]
-                fetched = conn.execute(
-                    f"SELECT temperature FROM readings WHERE hour_ts IN "
-                    f"({','.join('?' * len(hour_list))})",
-                    hour_list,
-                ).fetchall()
-                seg_total = len(fetched)
-                seg_over = sum(1 for r in fetched if r["temperature"] > OVER_TEMP_THRESHOLD)
+                # 聚合下推给 SQLite：只取回各小时的计数，不把温度明细加载进应用内存
+                agg_rows = conn.execute(
+                    f"SELECT COUNT(*) AS cnt, "
+                    f"SUM(CASE WHEN temperature > ? THEN 1 ELSE 0 END) AS over "
+                    f"FROM readings WHERE hour_ts IN ({','.join('?' * len(hour_list))})",
+                    (OVER_TEMP_THRESHOLD, *hour_list),
+                ).fetchone()
+                seg_total = agg_rows["cnt"]
+                seg_over = agg_rows["over"]
                 summary_id = None
                 rows_read += seg_total
             total += seg_total

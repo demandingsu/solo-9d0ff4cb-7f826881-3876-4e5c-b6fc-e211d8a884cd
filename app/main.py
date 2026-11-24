@@ -121,12 +121,29 @@ def hours(conn: sqlite3.Connection = Depends(get_conn)):
 
 @app.post("/summaries", status_code=201, tags=["摘要"])
 def create_summary(body: IntervalIn, conn: sqlite3.Connection = Depends(get_conn)):
-    """为齐备的整点区间 [start, end) 生成摘要；任一小时缺明细返回 409。"""
+    """为齐备的整点区间 [start, end) 生成摘要；任一小时缺明细返回 409。
+
+    汇总在只读事务中完成，不阻塞整点更正。若发布时发现统计所用的小时版本
+    已被更正（发生变化），返回 409 并列出变化的 UTC 小时，本次摘要不登记，
+    可在更正完成后重新发起。
+    """
     start_ts, end_ts = to_ts(body.start), to_ts(body.end)
     try:
         result = logic.make_summary(conn, start_ts, end_ts)
     except logic.MissingHoursError as e:
         raise HTTPException(status_code=409, detail=_missing_hours_payload(e))
+    except logic.SummaryConflictError as e:
+        shown = e.changed_ts[:24]
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "summary_conflict",
+                "message": "汇总期间区间内的小时明细已被更正，统计所用版本已变化，本次摘要未登记",
+                "changed_count": len(e.changed_ts),
+                "changed_hours": [to_iso(t) for t in shown],
+                "truncated": len(e.changed_ts) > len(shown),
+            },
+        )
     return {
         "id": result["id"],
         "start": to_iso(start_ts),
